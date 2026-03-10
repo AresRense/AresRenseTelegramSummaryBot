@@ -85,35 +85,7 @@ async def handle_pdf(update, context):
     summary = await summarize(text)
     await update.message.reply_text(summary)
 
-
-async def handle_voice(update, context):
-    await update.message.reply_text("Гс получен!")
-    file = await context.bot.get_file(update.message.voice.file_id)
-    file_bytes = await file.download_as_bytearray()
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        messages=[
-            {
-                "role": "user", "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "audio/ogg",
-                            "data": __import__("base64").b64encode(file_bytes).decode()
-                        }
-                    },
-                    {"type": "text", "text": "Summarize this voice message conscisely in Русский."}
-                ]
-            }
-        ]
-    )
-    await update.message.reply_text(message.content[0].text)
-
 app = Application.builder().token(TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT, handle_message))
 app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 app.run_polling()
