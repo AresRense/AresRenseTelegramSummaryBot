@@ -562,11 +562,12 @@ async def send_confirmation(query, user_id: int) -> None:
     if not entry:
         await query.edit_message_text("данные устарели")
         return
+    cost_message, _ = build_cost_message(entry["content"])
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("подтвердить", callback_data="confirm_summary"),
         InlineKeyboardButton("отменить", callback_data="cancel_summary"),
     ]])
-    await query.edit_message_text(f"цена: {cost_message} подтвердить конспектирование?", reply_markup=keyboard)
+    await query.edit_message_text(cost_message, reply_markup=keyboard)
 
 
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
