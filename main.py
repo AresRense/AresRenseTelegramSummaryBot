@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes, CallbackQueryHandler, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 
 load_dotenv()
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
