@@ -18,12 +18,18 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 
+
+litellm.suppress_debug_info = True
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
 
 load_dotenv()
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -35,15 +41,44 @@ ALLOWED_USERS = [
     if uid.strip()
 ]
 
-MODEL = "claude-3-haiku-20240307"
-MAX_INPUT_TOKENS = 200_000
-MAX_OUTPUT_TOKENS = 4_096
+MODEL = "claude-haiku-4-5-20251001"
+MAX_INPUT_TOKENS = 50_000
+MAX_OUTPUT_TOKENS = 8_192
+
 
 pending: dict[int, dict] = {}
 
+_cancel_send: dict[int, bool] = {}
+
+
 LITELLM_PRICE_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
+
 MAX_SUMMARY_INPUT = math.floor(MAX_OUTPUT_TOKENS / 0.15)
+
+
+_token_bucket = {"input_used": 0, "output_used": 0, "window_start": 0.0}
+INPUT_PER_MINUTE = 50_000
+OUTPUT_PER_MINUTE = 30_000
+
+
+def wait_for_token_budget(input_tokens: int, output_tokens: int) -> None:
+    now = time.time()
+    bucket = _token_bucket
+    if now - bucket["window_start"] >= 60:
+        bucket["input_used"] = 0
+        bucket["output_used"] = 0
+        bucket["window_start"] = now
+    if (bucket["input_used"] + input_tokens > INPUT_PER_MINUTE or
+            bucket["output_used"] + output_tokens > OUTPUT_PER_MINUTE):
+        wait = 65 - (now - bucket["window_start"])
+        logger.info("rate limit: waiting %.1fs (in=%d, out=%d)", wait, input_tokens, output_tokens)
+        time.sleep(wait)
+        bucket["input_used"] = 0
+        bucket["output_used"] = 0
+        bucket["window_start"] = time.time()
+    bucket["input_used"] += input_tokens
+    bucket["output_used"] += output_tokens
 
 
 def get_model_pricing() -> tuple[float, float]:
@@ -69,7 +104,10 @@ RUB_CACHE_TTL = 60 * 30
 
 def calculate_optimal_output_tokens(input_tokens: int) -> int:
     ratio = random.randint(10, 20) / 100
-    return min(math.ceil(input_tokens * ratio), MAX_OUTPUT_TOKENS)
+    result = min(math.ceil(input_tokens * ratio), MAX_OUTPUT_TOKENS)
+    logger.debug(
+        "optimal output tokens: input=%d, ratio=%.2f, result=%d", input_tokens, ratio, result)
+    return result
 
 
 def calculate_cost_usd(input_tokens: int, output_tokens: int) -> float:
@@ -82,6 +120,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def _find_split_position(text: str, target_pos: int, search_radius: int, source: str = "text", text_type: str = "scientific") -> int:
+    logger.debug(
+        "finding split at target=%d, radius=%d", target_pos, search_radius)
 
     lo = max(0, target_pos - search_radius)
     window = text[lo:target_pos]
@@ -132,12 +172,14 @@ def _find_split_position(text: str, target_pos: int, search_radius: int, source:
 def get_rub_rate() -> float:
     now = time.time()
     if _rub_cache and (now - _rub_cache.get("fetched_at", 0)) < RUB_CACHE_TTL:
+        logger.debug("rub rate cache hit: %.2f", _rub_cache["rate"])
         return _rub_cache["rate"]
     try:
         response = requests.get(
             'https://api.exchangerate-api.com/v4/latest/USD', timeout=5)
         response.raise_for_status()
         rate = float(response.json()["rates"]["RUB"])
+        logger.info("rub rate fetched: %.2f", rate)
         _rub_cache["rate"] = rate
         _rub_cache["fetched_at"] = now
         return rate
@@ -160,6 +202,9 @@ def _update_notes(current_notes: str, z: str) -> str:
         f"locations, and concepts from the new section. Remove nothing already there. "
         f"Keep entries concise. Reply only with the updated scratchpad as a bullet list"
     )
+    
+    wait_for_token_budget(estimate_tokens(prompt), 400)
+
     try:
         response = client.messages.create(
             model=MODEL,
@@ -168,6 +213,7 @@ def _update_notes(current_notes: str, z: str) -> str:
         )
         return response.content[0].text.strip()
     except Exception:
+        logger.warning("scratchpad update failed")
         return current_notes
 
 
@@ -178,6 +224,8 @@ def _summarize_all_sync(plan: list[list[str]], lang: str = "Русский") -> 
     for sub_chunks in plan:
         for sc in sub_chunks:
             out = calculate_optimal_output_tokens(estimate_tokens(sc))
+            logger.info("summarizing chunk: tokens=%d, max_output=%d",
+                        estimate_tokens(sc), out)
             z = _call_claude_sync(sc, out, lang, notes)
             zs.append(z)
             notes = _update_notes(notes, z)
@@ -187,17 +235,27 @@ def _summarize_all_sync(plan: list[list[str]], lang: str = "Русский") -> 
 
 async def summarize_content(content: str, lang: str = "Русский", source: str = "text", text_type: str = "scientific") -> str:
     plan = plan_chunks(content, source, text_type)
+    logger.info(
+        "plan created: %d groups, source=%s, type=%s", len(plan), source, text_type)
     return await asyncio.to_thread(_summarize_all_sync, plan, lang)
 
 
 def _call_claude_sync(chunk: str, max_tokens: int, lang: str = "Русский", notes: str = "") -> str:
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "user", "content": f"{notes}Summarize the following concisely in {lang}:\n\n{chunk}"}]
-    )
-    return message.content[0].text
+    logger.debug("calling claude: chunk_tokens=%d, max_tokens=%d",
+                 estimate_tokens(chunk), max_tokens)
+    wait_for_token_budget(estimate_tokens(chunk), max_tokens)
+    while True:
+        try:
+            message = client.messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "user", "content": f"{notes}Summarize the following concisely in {lang}:\n\n{chunk}"}]
+            )
+            return message.content[0].text
+        except anthropic.RateLimitError as e:
+            logger.warning("rate limit 429, waiting 65s: %s", e)
+            time.sleep(65)
 
 
 def _is_split_compatible(text: str, pos: int, para_sample: int) -> bool:
@@ -213,12 +271,15 @@ def _is_split_compatible(text: str, pos: int, para_sample: int) -> bool:
         "Reply with exactly one word: CONTINUOUS or DISTINCT"
     )
     try:
+        logger.debug("checking split compatibility at pos=%d", pos)
+        wait_for_token_budget(estimate_tokens(prompt), 5)
         response = client.messages.create(
             model=MODEL,
             max_tokens=5,
             messages=[{"role": "user", "content": prompt}]
         )
         answer = response.content[0].text.strip().upper()
+        logger.debug("split compatibility result: %s", answer)
         return answer == "CONTINUOUS"
     except Exception:
         return False
@@ -314,65 +375,8 @@ def _split_y_from_x(x: str, source: str, text_type: str) -> list[str]:
 
 def plan_chunks(content: str, source: str = "text", text_type: str = "scientific") -> list[list[str]]:
     x_list = _split_x_from_x(content, source, text_type)
+    logger.info("plan_chunks: %d x-chunks", len(x_list))
     return [_split_y_from_x(x, source, text_type) for x in x_list]
-
-
-def _estimate_para_sample(text: str, source: str = "text", text_type: str = "scientific") -> int:
-    paragraphs = [p for p in text.split("\n\n") if p.strip()]
-    num_paras = len(paragraphs)
-    if num_paras >= 2:
-        avg_para = len(text) / num_paras
-    else:
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        avg_sent = len(text) / max(len(sentences), 1)
-        avg_para = avg_sent * 5
-
-    if source == "youtube" and text_type == "entertainment":
-        lo, hi = 200, 600
-    elif source == "youtube" and text_type == "scientific":
-        lo, hi = 400, 1200
-    elif text_type == "fictional":
-        lo, hi = 600, 2000
-    elif text_type == "scientific":
-        lo, hi = 300, 1200
-    else:
-        lo, hi = 300, 1000
-
-    return max(lo, min(hi, math.ceil(avg_para)))
-
-
-def estimate_plan_tokens(plan: list[list[str]]) -> tuple[int, int, int]:
-    total_in, total_out, total_calls = 0, 0, 0
-    y_out_tokens: list[int] = []
-
-    for sub_chunks in plan:
-        if len(sub_chunks) == 1:
-            y_in = estimate_tokens(sub_chunks[0])
-            y_out = calculate_optimal_output_tokens(y_in)
-            total_in += y_in
-            total_out += y_out
-            total_calls += 1
-            y_out_tokens.append(y_out)
-        else:
-            sub_out_sum = 0
-            for sc in sub_chunks:
-                sc_out = calculate_optimal_output_tokens(estimate_tokens(sc))
-                total_in += estimate_tokens(sc)
-                total_out += sc_out
-                total_calls += 1
-                sub_out_sum += sc_out
-
-            total_in += sub_out_sum
-            total_out += MAX_OUTPUT_TOKENS
-            total_calls += 1
-            y_out_tokens.append(MAX_OUTPUT_TOKENS)
-
-    if len(plan) > 1:
-        total_in += sum(y_out_tokens)
-        total_out += MAX_OUTPUT_TOKENS
-        total_calls += 1
-
-    return total_in, total_out, total_calls
 
 
 def check_integrity(content: str) -> tuple[bool, str]:
@@ -385,6 +389,7 @@ def check_integrity(content: str) -> tuple[bool, str]:
 
 def build_cost_message(content: str) -> tuple[str, float]:
     input_tokens = estimate_tokens(content)
+    logger.info("building cost: tokens=%d", input_tokens)
     if input_tokens > MAX_INPUT_TOKENS:
         num_chunks = math.ceil(input_tokens / MAX_INPUT_TOKENS)
         chunk_size = math.ceil(input_tokens / num_chunks)
@@ -405,25 +410,42 @@ def build_cost_message(content: str) -> tuple[str, float]:
         cost_rubs = cost_usd * rub_rate
         cost_block = (
             f"цены {MODEL}:\n"
-            f"рассмотрение текста для конспектирования: {input_per_m}/млн токенов\n"
-            f"генерация конспекта: {output_per_m}/млн токенов\n"
+            f"рассмотрение текста для конспектирования: {input_per_m}$/млн токенов\n"
+            f"генерация конспекта: {output_per_m}$/млн токенов\n"
             f"стоимость данного запроса:\n"
-            f"{cost_cents:.4f}$\n"
+            f"{cost_cents:.4f}(центов)\n"
             f"{cost_rubs:.4f}руб (курс {rub_rate:.2f} руб/$)\n\n"
         )
-        cost_usd_result = 0.0
+        cost_usd_result = cost_usd
     except RuntimeError:
         cost_block = "ошибка рассчёта\n"
         cost_usd_result = 0.0
 
+    time_est = estimate_time(content)
     message = (
         f"запрос\n"
         f"модель: {MODEL}\n"
         f"{cost_block}"
+        f"рассчётное время: {time_est}\n"
         f"подтвердить?"
     )
     return message, cost_usd_result
 
+
+def estimate_time(content: str) -> str:
+    input_tokens = estimate_tokens(content)
+    if input_tokens > MAX_INPUT_TOKENS:
+        num_chunks = math.ceil(input_tokens / MAX_INPUT_TOKENS)
+    else:
+        num_chunks = 1
+    api_seconds = num_chunks * 15
+    rate_limit_seconds = max(0, (num_chunks - 1)) * 60 * (input_tokens / INPUT_PER_MINUTE)
+    total_seconds = api_seconds + rate_limit_seconds
+    minutes = int(total_seconds // 60)
+    seconds = int(total_seconds % 60)
+    if minutes > 0:
+        return f"~{minutes}мин {seconds}сек"
+    return f"~{seconds}сек"
 
 def _upgrade_litellm():
     try:
@@ -436,9 +458,9 @@ def _upgrade_litellm():
         litellm.register_model(
             model_cost="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
         )
-        print("[litellm] updated successfully")
+        logger.info("[litellm] updated successfully")
     except Exception as e:
-        print(f"[litellm] update failed {e}")
+        logger.error("[litellm] update failed: %s", e)
 
 
 def schedule_litellm_updates(interval_days: int = 7):
@@ -455,6 +477,29 @@ def is_allowed(user_id):
     return user_id in ALLOWED_USERS
 
 
+async def send_summary(target, summary: str, chat_id: int) -> None:
+    logger.info("sending summary: %d chars, as_file=%s",
+                len(summary), len(summary) > 4096)
+    _cancel_send[chat_id] = False
+    attempt = 0
+    while not _cancel_send.get(chat_id, False):
+        attempt += 1
+        try:
+            if len(summary) <= 4096:
+                await target.reply_text(summary)
+            else:
+                file = io.BytesIO(summary.encode("utf-8"))
+                file.name = "конспект.txt"
+                await target.reply_document(document=file, caption="длинный конспект, генерирую файл")
+            logger.info("summary sent on attempt %d", attempt)
+            _cancel_send.pop(chat_id, None)
+            return
+        except Exception as e:
+            logger.warning("send attempt %d/3 failed: %s", attempt + 1, e)
+            await asyncio.sleep(30)
+    logger.info("sending cancelled by user for chat_id=%d", chat_id)
+    _cancel_send.pop(chat_id, None)
+
 def is_youtube_url(text):
     return any(x in text for x in ["youtube.com/watch", "youtu.be", "youtube.com/shorts/"])
 
@@ -464,6 +509,7 @@ def is_url(text):
 
 
 def get_youtube_transcript(url):
+    logger.info("extracting video_id from: %s", url)
     if "youtu.be/" in url:
         video_id = url.split("youtu.be/")[1].split("?")[0]
     elif "shorts" in url:
@@ -479,27 +525,18 @@ def get_youtube_transcript(url):
         transcript = transcript_list.find_any_transcript().fetch()
 
     full_text = " ".join([t.text for t in transcript])
+    logger.info("transcript fetched: %d chars", len(full_text))
     return full_text[:12000]
 
 
 def get_webpage_text(url):
+    logger.info("fetching webpage: %s", url)
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, timeout=10, headers=headers)
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
     return soup.get_text(separator=" ", strip=True)[:10000]
-
-
-def _summarize_sync(content, lang="Русский"):
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        messages=[
-            {"role": "user", "content": f"Summarize the following concisely in {lang}:\n\n{content}"}
-        ]
-    )
-    return message.content[0].text
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -510,6 +547,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "любую ссылку(могу YouTube)\n"
         "PDF файл\n"
     )
+
+
+async def stop_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id in _cancel_send:
+        _cancel_send[chat_id] = True
+        await update.message.reply_text("отправка отменена")
+        logger.info("user cancelled send for chat_id=%d", chat_id)
+    else:
+        await update.message.reply_text("нечего отменять")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -538,7 +585,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             content = text
 
         summary = await summarize_content(content)
-        await update.message.reply_text(summary)
+        await send_summary(update.message, summary, update.message.chat_id)
 
     except (TranscriptsDisabled, NoTranscriptFound) as e:
         logger.warning("no transcript for: %s", text)
@@ -558,13 +605,21 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("недопуск")
         return
     await update.message.reply_text("pdf принят")
+    logger.info("pdf received from user_id=%d", user_id)
     try:
-        file = await context.bot.get_file(update.message.document.file_id)
-        file_bytes = await file.download_as_bytearray()
+        while True:
+            try:
+                file = await context.bot.get_file(update.message.document.file_id)
+                file_bytes = await file.download_as_bytearray(read_timeout=300, write_timeout=300)
+                break            
+            except Exception as e:
+                logger.warning("pdf download attempt failed: %s, retrying in 30s", e)
+                await asyncio.sleep(30)
         reader = PdfReader(io.BytesIO(file_bytes))
         content = " ".join(
             [page.extract_text() or "" for page in reader.pages])
         if not content.strip():
+            logger.warning("empty pdf from user_id=%d", user_id)
             await update.message.reply_text("текст не был извлечён")
             return
         valid, error = check_integrity(content)
@@ -572,15 +627,21 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text(f"ошибка")
             return
         pending[user_id] = {"content": content,
-                            "source": "pdf", "text_type": None}
+                                "source": "pdf", "text_type": None}
         await ask_text_type(update, user_id, "pdf")
     except Exception as e:
         logger.error("PDF processing failed for user_id=%d: %s",
-                     user_id, e, exc_info=True)
-        await update.message.reply_text(f"ошибка обработки пдф {str(e)}")
+                        user_id, e, exc_info=True)
+        while True:
+            try:
+                await update.message.reply_text(f"ошибка обработки пдф {str(e)}")
+                break
+            except Exception:
+                await asyncio.sleep(30)
 
 
 async def send_confirmation(query, user_id: int) -> None:
+    logger.info("sending confirmation to user_id=%d", user_id)
     entry = pending.get(user_id)
     if not entry:
         await query.edit_message_text("данные устарели")
@@ -596,8 +657,10 @@ async def send_confirmation(query, user_id: int) -> None:
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = query.from_user.id
-    await query.answer()
-
+    try:
+        await query.answer()
+    except Exception:
+        pass
     if query.data in ("type_scientific", "type_fictional", "type_entertainment"):
         entry = pending.get(user_id)
         if not entry:
@@ -624,9 +687,11 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 source=entry["source"],
                 text_type=entry["text_type"],
             )
-            await query.message.reply_text(summary)
-        except:
-            return
+            await send_summary(query.message, summary, query.message.chat_id)
+        except Exception as e:
+            logger.error("summarization failed for user_id=%d: %s",
+                         user_id, e, exc_info=True)
+            await query.message.reply_text(f"ошибка: {e}")
 
 
 async def ask_text_type(update: Update, user_id: int, source: str) -> None:
@@ -636,20 +701,28 @@ async def ask_text_type(update: Update, user_id: int, source: str) -> None:
             InlineKeyboardButton(
                 "Развлекательный", callback_data="type_entertainment"),
         ]])
-        await update.message.reply_text("Какой тип видео?", reply_markup=keyboard)
+        text = "Какой тип видео?"
     else:
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("научный", callback_data="type_scientific"),
             InlineKeyboardButton(
                 "художественный", callback_data="type_fictional")
         ]])
-        await update.message.reply_text("какой тип текста?", reply_markup=keyboard)
+        text = "какой тип текста?"
+    while True:
+        try:
+            await update.message.reply_text(text, reply_markup=keyboard)
+            return
+        except Exception as e:
+            logger.warning("ask_text_type failed: %s, retrying is 30s", e)
+            await asyncio.sleep(30)
 
 logger.info("инициализация")
 
 schedule_litellm_updates()
 app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("stop", stop_send))
 app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
