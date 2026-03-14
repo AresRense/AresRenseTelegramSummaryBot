@@ -1,3 +1,4 @@
+import logging
 import os
 import io
 import anthropic
@@ -16,6 +17,13 @@ from pypdf import PdfReader
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -49,7 +57,8 @@ def get_model_pricing() -> tuple[float, float]:
             output_per_t = data.get("output_cost_per_token")
             if input_per_t and output_per_t:
                 return input_per_t * 1_000_000, output_per_t * 1_000_000
-        except Exception:
+        except Exception as e:
+            logger.debug("pricing source failed: %s", e)
             continue
     raise RuntimeError("не получилось вывести цену запроса")
 
@@ -132,7 +141,8 @@ def get_rub_rate() -> float:
         _rub_cache["rate"] = rate
         _rub_cache["fetched_at"] = now
         return rate
-    except Exception:
+    except Exception as e:
+        logger.warning("Rub rate fetch failed: %s, using fallback", e)
         fallback = 90.0
         _rub_cache["rate"] = fallback
         return fallback
@@ -505,8 +515,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text.strip()
+    logger.info("message from user_id=%d, tokens=%d",
+                user_id, estimate_tokens(text))
 
     if not is_allowed(user_id):
+        logger.warning("access denied for user_id=%d", user_id)
         await update.message.reply_text("Access denied")
         return
 
@@ -514,20 +527,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if is_youtube_url(text):
+            logger.info("fetching youtube transcript: %s", text)
             content = get_youtube_transcript(text)
         elif is_url(text):
+            logger.info("fetching webpage: %s", text)
             content = get_webpage_text(text)
         else:
+            logger.info(
+                "summarizing plain text, tokens=%d", estimate_tokens(text))
             content = text
 
         summary = await summarize_content(content)
         await update.message.reply_text(summary)
 
-    except (TranscriptsDisabled, NoTranscriptFound):
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        logger.warning("no transcript for: %s", text)
         await update.message.reply_text("у этого видео нет субтитров")
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        logger.error("request failed for %s: %s", text, e)
         await update.message.reply_text("не получилось загрузить страницу")
     except Exception as e:
+        logger.error("unexpected error for user_id=%d: %s",
+                     user_id, e, exc_info=True)
         await update.message.reply_text(f"ошибка: {str(e)}")
 
 
@@ -554,6 +575,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                             "source": "pdf", "text_type": None}
         await ask_text_type(update, user_id, "pdf")
     except Exception as e:
+        logger.error("PDF processing failed for user_id=%d: %s",
+                     user_id, e, exc_info=True)
         await update.message.reply_text(f"ошибка обработки пдф {str(e)}")
 
 
@@ -622,6 +645,7 @@ async def ask_text_type(update: Update, user_id: int, source: str) -> None:
         ]])
         await update.message.reply_text("какой тип текста?", reply_markup=keyboard)
 
+logger.info("инициализация")
 
 schedule_litellm_updates()
 app = Application.builder().token(TOKEN).build()
@@ -630,4 +654,5 @@ app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
 app.add_handler(CallbackQueryHandler(handle_confirmation))
+logger.info("polling started")
 app.run_polling()
